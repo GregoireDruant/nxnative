@@ -69,3 +69,4 @@ int dm_movie_playing(void);   // hle_movie.c: a video decoder of the SDK's movie
 void dm_audio_suspend(int on);
 uint64_t dm_audio_render_calls(void);   // Cumulative sound card callback count (the silent sink is not counted)
 void dm_audio_reset(void);   // iOS media services reset: recreate the AudioUnits (hle_audio.c)
+int dm_audio_device_channels(void);   // Output channels: 6 (5.1 surround over HDMI / multichannel device) or 2 (stereo)

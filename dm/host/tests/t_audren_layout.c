@@ -66,6 +66,38 @@ static size_t build(int sdk, int ncmd) {
     return (size_t)(q - list);
 }
 
+static size_t build6(int sdk, int ncmd) {
+    memset(list, 0, sizeof list);
+    *(uint32_t *)(list + 4) = (uint32_t)ncmd; *(const int32_t **)(list + 8) = mix; *(uint32_t *)(list + 0x14) = SAMPLES; *(uint32_t *)(list + 0x18) = 48000;
+    uint8_t *q = list + 0x20;
+    for (int i = 0; i < ncmd - 1; i++) q = put(q, sdk, 6, 0x40);
+    int id = sdk <= 5 ? 0xf : sdk == 6 ? 0x10 : sdk == 21 ? 0x14 : 0x13;
+    uint8_t *sink = q; q = put(q, sdk, id, sdk == 4 ? 0x130 : sdk == 5 ? 0x138 : sdk == 21 ? 0x140 : 0x148);
+    int count = sdk <= 5 ? 0x120 : sdk == 21 ? 0x128 : 0x130;
+    *(uint32_t *)(sink + count) = 6;
+    if (sdk == 4) { for (int j = 0; j < 6; j++) sink[0x124 + j] = (int8_t)j; }
+    else { for (int j = 0; j < 6; j++) *(int16_t *)(sink + count + 4 + 2 * j) = (int16_t)j; }
+    return (size_t)(q - list);
+}
+
+static void test_51(int sdk) {
+    g_sink_id = sdk == 21 ? 0x14 : 0x13;
+    for (int ch = 0; ch < 6; ch++) {
+        for (int s = 0; s < SAMPLES; s++) mix[ch * SAMPLES + s] = (ch + 1) * 1000;
+    }
+    int16_t out[FRAME_MAX * 6];
+    g_ar[0].out_ch = 6;
+    size_t n = build6(sdk, NCMD);
+    int got = capture(&g_ar[0], list, n, out);
+    assert(got == SAMPLES);
+    for (int s = 0; s < SAMPLES; s++) {
+        for (int ch = 0; ch < 6; ch++) {
+            assert(out[6 * s + ch] == (ch + 1) * 1000);
+        }
+    }
+    g_ar[0].out_ch = 0;
+}
+
 static void test_headers(void) {
     const int sdks[] = {4, 5, 6, 16, 21};
     for (size_t i = 0; i < sizeof sdks / sizeof *sdks; i++) {
@@ -279,11 +311,12 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--malformed")) { test_malformed(16, 0); return 0; }
     test_headers();
     const int sdks[] = {4, 5, 6, 16, 21};
-    for (size_t i = 0; i < sizeof sdks / sizeof *sdks; i++) for (int scenario = 0; scenario <= 4; scenario++) {
+    for (size_t i = 0; i < sizeof sdks / sizeof *sdks; i++) for (int scenario = 0; scenario <= 5; scenario++) {
         // Each renderer format starts in a fresh process, including capture's one-time layout and sink detection.
         pid_t pid = fork(); assert(pid >= 0);
         if (!pid) {
             if (scenario <= 1) test(sdks[i], scenario);
+            else if (scenario == 5) test_51(sdks[i]);
             else test_malformed(sdks[i], scenario - 2);
             _exit(0);
         }
@@ -291,6 +324,6 @@ int main(int argc, char **argv) {
         assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
     test_histogram();
-    puts("audren layout: update lock read off Update or UpdateImpl, renderers' own blocks, bounded histograms, malformed-list rejection, unaligned and truncated headers, SDK 4/5/6/16/21 stereo PCM and empty/incomplete startup recovery passed");
+    puts("audren layout: update lock read off Update or UpdateImpl, renderers' own blocks, bounded histograms, malformed-list rejection, unaligned and truncated headers, SDK 4/5/6/16/21 stereo/5.1 PCM and empty/incomplete startup recovery passed");
     return 0;
 }

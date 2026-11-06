@@ -85,6 +85,9 @@ HLE_FORCE("_ZN2nn5audio30GetAudioRendererWorkBufferSizeERKNS0_22AudioRendererPar
     return guest_n;
 }
 // ---------- rendering and output ----------
+int dm_audio_device_channels(void) __attribute__((weak));
+static int audren_device_channels(void) { return dm_audio_device_channels ? dm_audio_device_channels() : 2; }
+
 // One renderer's state. Only the render thread and the updates of this renderer touch it, apart from the one lock over all renderers' rendering (g_render_mu). Until 2026-11-04 this was one set of
 // globals: a second renderer's updates rendered catch-up frames into the first one's output queue, about 10% of its frames (Mario & Luigi: Brothership), and its own frames were never rendered otherwise
 enum { CQ = 4, AR_MAX = 4 };   // AR_MAX as g_rev below
@@ -94,14 +97,15 @@ typedef struct {
     uint8_t *sys;                            // its AudioRenderSystem, from its first render or update (ar_of_sys)
     _Atomic int open;
     void *render_tt;                         // the render thread (ThreadType from dm_guest_thread_spawn): Close joins it before the SDK tears the renderer down
-    int16_t frame[FRAME_MAX * 2]; int frame_n;   // the latest frame (stereo int16)
+    int out_ch;                              // output channels: 2 (stereo downmix) or 6 (5.1 surround)
+    int16_t frame[FRAME_MAX * 6]; int frame_n;   // the latest frame (up to 6 channels int16)
     _Atomic uint64_t frames, nonsilent, updates, renders, catchups;
     uint64_t last_r; int updated;            // the render count at the last update, once there was one
-    int16_t cq[CQ][FRAME_MAX * 2]; int cq_n[CQ]; _Atomic uint32_t cq_head, cq_tail;   // output queue of catch-up frames
+    int16_t cq[CQ][FRAME_MAX * 6]; int cq_n[CQ]; _Atomic uint32_t cq_head, cq_tail;   // output queue of catch-up frames
     pthread_mutex_t cq_mu; pthread_cond_t cq_cv;   // the render thread signals each frame it takes off the queue (catch-up pacing)
     int sink_logged;
     int32_t up_buf[2 * (15 + FRAME_MAX)]; uint32_t up_pos;   // up_3_2's last samples and position
-    int16_t pcm[NBUF][FRAME_MAX * 2]; gbuf bufs[NBUF];   // the blocks its output plays from: AudioOut queues only the pointer and copies the samples when the sound card asks (issue #1336)
+    int16_t pcm[NBUF][FRAME_MAX * 6]; gbuf bufs[NBUF];   // the blocks its output plays from: AudioOut queues only the pointer and copies the samples when the sound card asks (issue #1336)
 } ar_t;
 static ar_t g_ar[AR_MAX];
 static pthread_mutex_t g_ar_mu = PTHREAD_MUTEX_INITIALIZER;   // the slots' handle and sys fields
@@ -125,11 +129,12 @@ static ar_t *ar_of_sys(uint8_t *sys) {
 static void render_main(void *arg) {
     ar_t *a = arg; t_ar = a;
     void (*exec)(void *, void *) = gsym("_ZN2nn5audio29ExecuteAudioRendererRenderingENS0_19AudioRendererHandleE");
-    void *out = dm_pcmout_open(2);
+    int ch = a->out_ch ? a->out_ch : 2;
+    void *out = dm_pcmout_open(ch);
     gbuf *free_list[NBUF]; int nfree = NBUF;
     for (int i = 0; i < NBUF; i++) { a->bufs[i] = (gbuf){a->pcm[i], sizeof a->pcm[i], 0}; free_list[i] = &a->bufs[i]; }
     dm_pcmout_start(out);
-    LOG("audren: render thread %d started (%d buffers in flight, paced by the output)", ar_index(a), NBUF);
+    LOG("audren: render thread %d started (%d buffers in flight, %d channels, paced by the output)", ar_index(a), NBUF, ch);
     while (atomic_load(&a->open)) {
         while (!nfree) {   // wait for the output to hand a block back (silent sink / sound card, one every 5 ms); it signals each release, so the thread sleeps until then (it used to poll every 1 ms)
             gbuf *b = dm_pcmout_released(out);
@@ -144,8 +149,9 @@ static void render_main(void *arg) {
         else { a->frame_n = 0; exec(a->handle[0], a->handle[1]); src = a->frame; got = a->frame_n; }   // SDK: generate commands → CPU processing (output taken in the host takeover) → signal the game's renderer event
         int n = got ? got : 240;
         gbuf *b = free_list[--nfree];
-        if (got) memcpy(b->ptr, src, (size_t)n * 4); else memset(b->ptr, 0, (size_t)n * 4);
-        b->size = (uint64_t)n * 4;
+        size_t bytes = (size_t)n * (size_t)ch * sizeof(int16_t);
+        if (got) memcpy(b->ptr, src, bytes); else memset(b->ptr, 0, bytes);
+        b->size = (uint64_t)bytes;
         if (!dm_pcmout_append(out, b)) free_list[nfree++] = b;
     }
     dm_pcmout_close(out);   // the output would otherwise keep its sound card callback or silent sink running and hold one of the AudioOut slots after the renderer closes
@@ -234,7 +240,9 @@ static Result ar_open(void **handle, void *ev, const uint8_t *param, void *work,
     if (a) {   // the slot's old contents are of a closed renderer, whose thread has ended; memset leaves no lock held
         memset(a, 0, sizeof *a);
         pthread_mutex_init(&a->cq_mu, NULL); pthread_cond_init(&a->cq_cv, NULL);
-        a->handle[0] = handle[0]; a->handle[1] = handle[1]; atomic_store(&a->open, 1);
+        a->handle[0] = handle[0]; a->handle[1] = handle[1];
+        a->out_ch = audren_device_channels() >= 6 ? 6 : 2;
+        atomic_store(&a->open, 1);
     }
     pthread_mutex_unlock(&g_ar_mu);
     LOG("audren: renderer %d opened from %s+%#llx", a ? ar_index(a) : -1, m ? m->name : "host", m ? (unsigned long long)((uint8_t *)ra - m->base) : 0ULL);
@@ -395,25 +403,76 @@ static int capture(ar_t *a, const uint8_t *cl, size_t len, int16_t *dst) {
             // Input buffers: the mix buffers the DeviceSink inputs name, at the renderer's rate (with CPU rendering the SDK makes no upsampler, below)
             const int32_t *ch[6]; uint32_t k = nin > 6 ? 6 : nin;
             for (uint32_t j = 0; j < k; j++) ch[j] = mix + (size_t)in[j] * samples;
-            // Channel order front-left front-right center LFE back-left back-right; 6 → 2 with the system default downmix coefficients (front 1.0, center 0.707, LFE 0.251, back 0.707, Q15)
-            enum { CF = 32768, CC = 23167, CL = 8224, CB = 23167 };
-            static int32_t st[FRAME_MAX * 2];   // the stereo downmix before clamping (capture runs under g_render_mu)
-            for (uint32_t s = 0; s < samples; s++) {
-                int32_t l, r;
-                if (k >= 6) { int64_t c = (int64_t)ch[2][s] * CC + (int64_t)ch[3][s] * CL;
-                              l = (int32_t)(((int64_t)ch[0][s] * CF + c + (int64_t)ch[4][s] * CB) >> 15); r = (int32_t)(((int64_t)ch[1][s] * CF + c + (int64_t)ch[5][s] * CB) >> 15); }
-                else { l = ch[0][s]; r = k > 1 ? ch[1][s] : l; }
-                st[2 * s] = l; st[2 * s + 1] = r;
+            int out_ch = a->out_ch ? a->out_ch : 2;
+            if (out_ch == 6) {
+                // 5.1 Surround output: no downmix when the system supports 6 channels!
+                // Channel order: 0:FL, 1:FR, 2:Center, 3:LFE, 4:Surround Left, 5:Surround Right
+                uint64_t loud = 0;
+                if (rate == 32000) {
+                    enum { CF = 32768, CC = 23167, CL = 8224, CB = 23167 };
+                    static int32_t st[FRAME_MAX * 2];
+                    for (uint32_t s = 0; s < samples; s++) {
+                        int32_t l, r;
+                        if (k >= 6) {
+                            int64_t c = (int64_t)ch[2][s] * CC + (int64_t)ch[3][s] * CL;
+                            l = (int32_t)(((int64_t)ch[0][s] * CF + c + (int64_t)ch[4][s] * CB) >> 15);
+                            r = (int32_t)(((int64_t)ch[1][s] * CF + c + (int64_t)ch[5][s] * CB) >> 15);
+                        } else {
+                            l = ch[0][s]; r = k > 1 ? ch[1][s] : l;
+                        }
+                        st[2 * s] = l; st[2 * s + 1] = r;
+                    }
+                    uint32_t nout = up_3_2(a, st, samples, st);
+                    for (uint32_t s = 0; s < nout; s++) {
+                        int32_t l = st[2 * s], r = st[2 * s + 1];
+                        l = l > 32767 ? 32767 : l < -32768 ? -32768 : l;
+                        r = r > 32767 ? 32767 : r < -32768 ? -32768 : r;
+                        dst[6 * s + 0] = (int16_t)l;
+                        dst[6 * s + 1] = (int16_t)r;
+                        dst[6 * s + 2] = 0;
+                        dst[6 * s + 3] = 0;
+                        dst[6 * s + 4] = 0;
+                        dst[6 * s + 5] = 0;
+                        loud |= (uint64_t)l | (uint64_t)r;
+                    }
+                    atomic_fetch_add(&a->frames, 1); if (loud) atomic_fetch_add(&a->nonsilent, 1);
+                    return (int)nout;
+                } else {
+                    for (uint32_t s = 0; s < samples; s++) {
+                        for (uint32_t c = 0; c < 6; c++) {
+                            int32_t v = c < k ? ch[c][s] : 0;
+                            v = v > 32767 ? 32767 : v < -32768 ? -32768 : v;
+                            dst[6 * s + c] = (int16_t)v;
+                            loud |= (uint64_t)v;
+                        }
+                    }
+                    atomic_fetch_add(&a->frames, 1); if (loud) atomic_fetch_add(&a->nonsilent, 1);
+                    uint64_t f = atomic_load(&a->frames);
+                    if (f == 200 || f % 12000 == 0)
+                        LOG("audren: renderer %d rendered %llu frames (5.1 surround), %llu of them not silent", ar_index(a), (unsigned long long)f, (unsigned long long)atomic_load(&a->nonsilent));
+                    return (int)samples;
+                }
+            } else {
+                // Channel order front-left front-right center LFE back-left back-right; 6 → 2 with the system default downmix coefficients (front 1.0, center 0.707, LFE 0.251, back 0.707, Q15)
+                enum { CF = 32768, CC = 23167, CL = 8224, CB = 23167 };
+                static int32_t st[FRAME_MAX * 2];   // the stereo downmix before clamping (capture runs under g_render_mu)
+                for (uint32_t s = 0; s < samples; s++) {
+                    int32_t l, r;
+                    if (k >= 6) { int64_t c = (int64_t)ch[2][s] * CC + (int64_t)ch[3][s] * CL;
+                                  l = (int32_t)(((int64_t)ch[0][s] * CF + c + (int64_t)ch[4][s] * CB) >> 15); r = (int32_t)(((int64_t)ch[1][s] * CF + c + (int64_t)ch[5][s] * CB) >> 15); }
+                    else { l = ch[0][s]; r = k > 1 ? ch[1][s] : l; }
+                    st[2 * s] = l; st[2 * s + 1] = r;
+                }
+                uint32_t nout = rate == 48000 ? samples : up_3_2(a, st, samples, st);
+                uint64_t loud = 0;
+                for (uint32_t s = 0; s < 2 * nout; s++) {
+                    int32_t v = st[s]; v = v > 32767 ? 32767 : v < -32768 ? -32768 : v;
+                    dst[s] = (int16_t)v; loud |= (uint64_t)v;
+                }
+                atomic_fetch_add(&a->frames, 1); if (loud) atomic_fetch_add(&a->nonsilent, 1);
+                uint64_t f = atomic_load(&a->frames); if (f == 200 || f % 12000 == 0) LOG("audren: renderer %d rendered %llu frames, %llu of them not silent", ar_index(a), (unsigned long long)f, (unsigned long long)atomic_load(&a->nonsilent));
+                return (int)nout;
             }
-            uint32_t nout = rate == 48000 ? samples : up_3_2(a, st, samples, st);
-            uint64_t loud = 0;
-            for (uint32_t s = 0; s < 2 * nout; s++) {
-                int32_t v = st[s]; v = v > 32767 ? 32767 : v < -32768 ? -32768 : v;
-                dst[s] = (int16_t)v; loud |= (uint64_t)v;
-            }
-            atomic_fetch_add(&a->frames, 1); if (loud) atomic_fetch_add(&a->nonsilent, 1);
-            uint64_t f = atomic_load(&a->frames); if (f == 200 || f % 12000 == 0) LOG("audren: renderer %d rendered %llu frames, %llu of them not silent", ar_index(a), (unsigned long long)f, (unsigned long long)atomic_load(&a->nonsilent));
-            return (int)nout;
         }
         c += size;
     }
@@ -576,15 +635,18 @@ HLE_FORCE("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm", "renderer
     return res;
 }
 
-// Output device: one built-in speaker, stereo (the audio device service still goes through IPC; the host answers directly)
+// Output device: TV output (5.1 surround) or built-in speaker (stereo)
 enum { DEVNAME = 0x100 };
-static void out_devname(char *out) { memset(out, 0, DEVNAME); strlcpy(out, "AudioBuiltInSpeakerOutput", DEVNAME); }
-HLE_FORCE("_ZN2nn5audio25ListAudioOutputDeviceNameEPNS0_15AudioDeviceNameEi", "output device list: 1 built-in speaker", int, h_ad_List, char *names, int n) { if (n <= 0 || !names) return 0; out_devname(names); return 1; }
-HLE_FORCE("_ZN2nn5audio30GetActiveAudioOutputDeviceNameEPNS0_15AudioDeviceNameE", "active output device: built-in speaker", void, h_ad_Active, char *name) { out_devname(name); }
+static void out_devname(char *out) {
+    memset(out, 0, DEVNAME);
+    strlcpy(out, audren_device_channels() >= 6 ? "AudioTvOutput" : "AudioBuiltInSpeakerOutput", DEVNAME);
+}
+HLE_FORCE("_ZN2nn5audio25ListAudioOutputDeviceNameEPNS0_15AudioDeviceNameEi", "output device list: TV output or built-in speaker", int, h_ad_List, char *names, int n) { if (n <= 0 || !names) return 0; out_devname(names); return 1; }
+HLE_FORCE("_ZN2nn5audio30GetActiveAudioOutputDeviceNameEPNS0_15AudioDeviceNameE", "active output device: TV output or built-in speaker", void, h_ad_Active, char *name) { out_devname(name); }
 // The SDK 12 names (Engage): the same service, the same answers
-HLE_FORCE("_ZN2nn5audio19ListAudioDeviceNameEPNS0_15AudioDeviceNameEi", "output device list (SDK 12 name): 1 built-in speaker", int, h_ad_List12, char *names, int n) { return h_ad_List(names, n); }
-HLE_FORCE("_ZN2nn5audio24GetActiveAudioDeviceNameEPNS0_15AudioDeviceNameE", "active output device (SDK 12 name): built-in speaker", void, h_ad_Active12, char *name) { out_devname(name); }
-HLE_FORCE("_ZN2nn5audio41GetActiveAudioDeviceChannelCountForOutputEv", "output channel count: 2", int, h_ad_Channels, void) { return 2; }
+HLE_FORCE("_ZN2nn5audio19ListAudioDeviceNameEPNS0_15AudioDeviceNameEi", "output device list (SDK 12 name)", int, h_ad_List12, char *names, int n) { return h_ad_List(names, n); }
+HLE_FORCE("_ZN2nn5audio24GetActiveAudioDeviceNameEPNS0_15AudioDeviceNameE", "active output device (SDK 12 name)", void, h_ad_Active12, char *name) { out_devname(name); }
+HLE_FORCE("_ZN2nn5audio41GetActiveAudioDeviceChannelCountForOutputEv", "output channel count: 2 (stereo) or 6 (5.1 surround)", int, h_ad_Channels, void) { return audren_device_channels() >= 6 ? 6 : 2; }
 // Device volume: kept and read back (DRAGON QUEST VII Reimagined reads it at boot, main+0xee8edc), not applied: the host's output has the system's own volume
 static _Atomic float g_dev_vol = 1.0f;
 HLE_FORCE("_ZN2nn5audio26SetAudioDeviceOutputVolumeEPKNS0_15AudioDeviceNameEf", "device volume; kept for the getter, not applied by the host", void, h_ad_SetVol, const char *name, float v) { (void)name; atomic_store(&g_dev_vol, v); }
@@ -611,4 +673,4 @@ HLE_FORCE("_ZN2nn5audio38AcquireAudioDeviceNotificationForInputEPNS_2os11SystemE
 }
 // SDK 7 names of the two above (Super Mario Odyssey): the device-switch event and the active channel count
 HLE_FORCE("_ZN2nn5audio36AcquireAudioDeviceSwitchNotificationEPNS_2os11SystemEventE", "output device switch notification (SDK 7 name): bound, never signaled", void, h_ad_Notify7, void *ev) { hle_bind_system_event(ev, 0); }
-HLE_FORCE("_ZN2nn5audio21GetActiveChannelCountEv", "output channel count (SDK 7 name): 2", int, h_ad_Channels7, void) { return 2; }
+HLE_FORCE("_ZN2nn5audio21GetActiveChannelCountEv", "output channel count (SDK 7 name): 2 (stereo) or 6 (5.1 surround)", int, h_ad_Channels7, void) { return audren_device_channels() >= 6 ? 6 : 2; }

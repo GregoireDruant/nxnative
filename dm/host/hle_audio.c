@@ -126,12 +126,96 @@ static void pull(aout *a, uint8_t *dst, uint64_t n) {
     }
 }
 
-// A six-channel output (front-left front-right center LFE back-left back-right) goes to the device as stereo, downmixed here with the audio renderer's default Q15 coefficients (hle_audren.c):
-// Core Audio's own 6 → 2 mapping keeps only the front pair, so voices on the center (Luigi's Mansion 3) and the back channels were silent. The queue still takes all six guest channels,
-// in blocks through a stack buffer (no allocation in the real-time callback)
-static int device_channels(const aout *a) { return a->ch == 6 ? 2 : a->ch; }
+// A six-channel output (front-left front-right center LFE back-left back-right) goes to the device as 5.1 if supported, or downmixed to stereo:
+// Core Audio's own 6 → 2 mapping keeps only the front pair, so voices on the center (Luigi's Mansion 3) and the back channels were silent on stereo devices.
+// When 6 channels are supported by the output device (e.g. HDMI home cinema receiver), all 6 channels are passed through directly without downmixing.
+// The queue still takes all six guest channels, in blocks through a stack buffer (no allocation in the real-time callback).
+#if !TARGET_OS_IPHONE
+#ifndef kAudioObjectPropertyElementMain
+#define kAudioObjectPropertyElementMain 0
+#endif
+
+static int mac_device_out_channels(AudioDeviceID dev) {
+    if (dev == kAudioObjectUnknown || dev == 0) return 2;
+    AudioObjectPropertyAddress addr = {
+        kAudioDevicePropertyStreamConfiguration,
+        kAudioObjectPropertyScopeOutput,
+        kAudioObjectPropertyElementMain
+    };
+    UInt32 sz = 0;
+    if (AudioObjectGetPropertyDataSize(dev, &addr, 0, NULL, &sz) == noErr && sz > 0) {
+        AudioBufferList *bl = malloc(sz);
+        if (bl) {
+            int ch = 0;
+            if (AudioObjectGetPropertyData(dev, &addr, 0, NULL, &sz, bl) == noErr) {
+                for (UInt32 i = 0; i < bl->mNumberBuffers; i++)
+                    ch += bl->mBuffers[i].mNumberChannels;
+            }
+            free(bl);
+            if (ch > 0) return ch;
+        }
+    }
+    return 2;
+}
+
+static AudioDeviceID mac_default_output_device(void) {
+    AudioDeviceID dev = kAudioObjectUnknown;
+    AudioObjectPropertyAddress addr = {
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    UInt32 sz = sizeof dev;
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &sz, &dev) != noErr)
+        return kAudioObjectUnknown;
+    return dev;
+}
+#endif
+
+int dm_audio_device_channels(void) {
+    const char *e = getenv("DM_AUDIO_CHANNELS");
+    if (e) {
+        int v = atoi(e);
+        return v >= 6 ? 6 : 2;
+    }
+#if TARGET_OS_IPHONE
+    return 2;
+#else
+    AudioDeviceID dev = mac_default_output_device();
+    int ch = mac_device_out_channels(dev);
+    return ch >= 6 ? 6 : 2;
+#endif
+}
+
+static int aout_device_channels(const aout *a) {
+    const char *e = getenv("DM_AUDIO_CHANNELS");
+    if (e) {
+        int v = atoi(e);
+        return v >= 6 ? 6 : 2;
+    }
+#if TARGET_OS_IPHONE
+    return 2;
+#else
+    if (a && a->au) {
+        AudioDeviceID dev = kAudioObjectUnknown; UInt32 sz = sizeof dev;
+        if (!AudioUnitGetProperty(a->au, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &dev, &sz) && dev != kAudioObjectUnknown) {
+            int ch = mac_device_out_channels(dev);
+            if (ch >= 6) return 6;
+        }
+        AudioStreamBasicDescription df; sz = sizeof df;
+        if (!AudioUnitGetProperty(a->au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &df, &sz) && df.mChannelsPerFrame >= 6)
+            return 6;
+    }
+    return dm_audio_device_channels();
+#endif
+}
+
+static int device_channels(const aout *a) {
+    if (a->ch == 6) return aout_device_channels(a) >= 6 ? 6 : 2;
+    return a->ch;
+}
 static void pull_device(aout *a, uint8_t *dst, uint64_t bytes) {
-    if (a->ch != 6) { pull(a, dst, bytes); return; }
+    if (a->ch != 6 || device_channels(a) == 6) { pull(a, dst, bytes); return; }
     enum { BLOCK = 128, CF = 32768, CC = 23167, CL = 8224, CB = 23167 };
     int16_t scratch[BLOCK * 6], *out = (int16_t *)dst;
     uint64_t frames = bytes / (2 * sizeof *out);
@@ -240,6 +324,13 @@ static OSStatus au_create(aout *a) {
     au_buffer(a->au, NULL);
 #endif
     OSStatus st = AudioUnitSetProperty(a->au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &f, sizeof f);
+#if !TARGET_OS_IPHONE
+    if (!st && ch == 6) {
+        AudioChannelLayout acl = {0};
+        acl.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_5_1_D; // L, R, C, LFE, Ls, Rs
+        AudioUnitSetProperty(a->au, kAudioUnitProperty_AudioChannelLayout, kAudioUnitScope_Input, 0, &acl, sizeof acl);
+    }
+#endif
     if (!st) st = AudioUnitSetProperty(a->au, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof cb);
     if (!st) st = AudioUnitInitialize(a->au);
     if (st) { au_dispose(a->au); a->au = NULL; }
@@ -335,7 +426,7 @@ typedef struct { audio_stats stats; int id, ch; } audio_report;
 // Both consumers hold g_aos_lock. A local copy owns every log argument, so a slow log cannot hold up registry changes or retain a closed output.
 static int stats_take(aout *a, audio_report *r) {
     if (!atomic_load_explicit(&a->st_pending, memory_order_acquire)) return 0;
-    *r = (audio_report){a->st_report, a->id, a->ch};
+    *r = (audio_report){a->st_report, a->id, device_channels(a)};
     atomic_store_explicit(&a->st_pending, 0, memory_order_release);
     return 1;
 }
@@ -424,7 +515,10 @@ static Result au_open_at(void *g, void *ev, const char *name, const uint8_t *par
     pthread_create(&a->notify_th, NULL, event_notify, a);
     if (ev) hle_bind_system_event(ev, 1);   // Buffer release event: bind a kernel event on the guest thread (auto-clear), afterwards signaled by the audio thread
     char sb[64]; int use_au = real_audio();
-    LOG("audio #%d OpenAudioOut %s channels %d %s%s (call site %s)", a->id, name ? name : "(default)", ch, use_au ? "real output" : "silent sink", ev ? "" : ", no release event (the game polls)", site(lr, sb, sizeof sb));
+    int dev_ch = device_channels(a);
+    LOG("audio #%d OpenAudioOut %s channels %d (%s) %s%s (call site %s)", a->id, name ? name : "(default)", ch,
+        dev_ch == 6 ? "5.1 surround" : (ch == 6 ? "stereo downmix" : "stereo"),
+        use_au ? "real output" : "silent sink", ev ? "" : ", no release event (the game polls)", site(lr, sb, sizeof sb));
     // The helper finishes (and is joined) before lifecycle/watchdog readers can find this output.
     // Keep construction outside g_aos_lock: joining the helper can yield the guest core.
     if (use_au) au_open(a);

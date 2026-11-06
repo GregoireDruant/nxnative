@@ -65,6 +65,41 @@ static int test_surround_output(void) {
     puts("surround callback: all six channels audible, saturation and split-buffer release verified");
     return 0;
 }
+
+// When 5.1 output is supported, all six channels must pass through directly
+// without downmixing (front-left, front-right, center, LFE, surround-left, surround-right).
+static int test_surround_51_passthrough(void) {
+    enum { FRAMES = 273, SPLIT = 17 };
+    setenv("DM_AUDIO_CHANNELS", "6", 1);
+    for (int test = 0; test < 6; test++) {
+        int16_t in[FRAMES * 6] = {0}, out[FRAMES * 6];
+        for (int f = 0; f < FRAMES; f++) for (int ch = 0; ch < 6; ch++)
+            in[f * 6 + ch] = (ch == test) ? 12345 : 0;
+        memset(out, 0xa5, sizeof out);
+        gbuf b[2] = {{in, SPLIT * 12, SPLIT * 12}, {in + SPLIT * 6, (FRAMES - SPLIT) * 12, (FRAMES - SPLIT) * 12}};
+        aout a = {.ch = 6};
+        atomic_init(&a.state, STATE_STARTED); atomic_init(&a.vol, 0x3f800000u);
+        a.q[0] = b; a.q[1] = b + 1; atomic_init(&a.q_tail, 2);
+        AudioBufferList bl = {.mNumberBuffers = 1, .mBuffers = {{6, sizeof out, out}}};
+        au_render(&a, NULL, NULL, 0, FRAMES, &bl);
+        for (int f = 0; f < FRAMES; f++) for (int ch = 0; ch < 6; ch++) {
+            int16_t exp = (ch == test) ? 12345 : 0;
+            if (out[f * 6 + ch] != exp) {
+                printf("FAIL 5.1 passthrough: case %d frame %d channel %d expected %d got %d\n", test, f, ch, exp, out[f * 6 + ch]);
+                unsetenv("DM_AUDIO_CHANNELS");
+                return 1;
+            }
+        }
+        if (atomic_load(&a.q_head) != 2 || atomic_load(&a.rel_tail) != 2 || a.rel[0] != b || a.rel[1] != b + 1 || a.pos || atomic_load(&a.under_n)) {
+            puts("FAIL 5.1 passthrough: guest buffer consumption / release order");
+            unsetenv("DM_AUDIO_CHANNELS");
+            return 1;
+        }
+    }
+    unsetenv("DM_AUDIO_CHANNELS");
+    puts("surround 5.1 passthrough: all six channels preserved without downmixing");
+    return 0;
+}
 // The guest AudioOut's front as the SDK fills it (au_info), and its lifetime under a guard like the middleware's: open, play, go to the background, close only if the first word says open,
 // make the PCM inaccessible (a consumer left running would fault on it) and come back, 12 times (PR #109). Old pages stay mapped PROT_NONE, so no new buffer lands at a stale address
 static int test_output_lifetime(void) {
@@ -96,7 +131,7 @@ static int test_output_lifetime(void) {
     return 0;
 }
 int main(void) {
-    if (test_surround_output() || test_output_lifetime()) return 1;
+    if (test_surround_output() || test_surround_51_passthrough() || test_output_lifetime()) return 1;
     char out[64], ev[64]; uint8_t prm[16]; gbuf b[3]; static int16_t pcm[3][4800 * 2];
     h_au_InitParam(prm);
     if (h_au_Open(out, ev, NULL, prm)) return 1;
